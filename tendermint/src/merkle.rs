@@ -1,7 +1,6 @@
 //! Merkle tree used in Tendermint networks
 
 pub mod proof;
-
 use sha2::{Digest, Sha256};
 
 /// Size of Merkle root hash

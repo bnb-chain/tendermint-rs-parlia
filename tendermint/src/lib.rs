@@ -6,7 +6,6 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(
-    warnings,
     missing_docs,
     trivial_casts,
     trivial_numeric_casts,
@@ -32,6 +31,7 @@ pub mod consensus;
 pub mod evidence;
 pub mod genesis;
 pub mod hash;
+pub mod lite;
 pub mod merkle;
 mod moniker;
 pub mod net;
@@ -55,8 +55,7 @@ pub use crate::{
     block::Block,
     error::{Error, Kind},
     genesis::Genesis,
-    hash::AppHash,
-    hash::Hash,
+    hash::{AppHash, Hash},
     moniker::Moniker,
     private_key::PrivateKey,
     proposal::Proposal,

@@ -433,10 +433,10 @@ pub struct CanonicalBlockId {
 #[derive(Clone, PartialEq, ::prost::Message)]
 #[derive(::serde::Deserialize, ::serde::Serialize)]
 pub struct CanonicalPartSetHeader {
-    #[prost(uint32, tag="1")]
-    pub total: u32,
-    #[prost(bytes, tag="2")]
+    #[prost(bytes, tag="1")]
     pub hash: std::vec::Vec<u8>,
+    #[prost(uint32, tag="2")]
+    pub total: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CanonicalProposal {
