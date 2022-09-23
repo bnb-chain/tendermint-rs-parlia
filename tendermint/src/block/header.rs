@@ -193,7 +193,7 @@ impl Header {
         fields_bytes.push(self.evidence_hash.unwrap_or_default().encode_vec().unwrap());
         fields_bytes.push(self.proposer_address.encode_vec().unwrap());
 
-        Hash::Sha256(simple_hash_from_byte_vectors(fields_bytes))
+        Hash::Sha256(simple_hash_from_byte_vectors(fields_bytes).unwrap())
     }
 }
 

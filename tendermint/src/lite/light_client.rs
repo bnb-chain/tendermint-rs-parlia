@@ -157,12 +157,12 @@ impl TmHeaderVerifier {
 
         TmHeaderVerifier::verify_sufficient_signers_overlap(&header)?;
 
-        let next_validator_set = cs
-            .next_validator_set
+        let next_validator_set = header
+            .next_validator_set.unwrap().validators
             .iter()
             .map(|validator| Validator {
                 pub_key: validator.pub_key.clone(),
-                voting_power: validator.voting_power,
+                voting_power: validator.voting_power as u64,
             })
             .collect();
         let new_cs = ConsensusState {
@@ -185,10 +185,13 @@ impl TmHeaderVerifier {
                 .validators_hash,
             next_validator_set,
         };
-        let validator_set_changed = new_cs.cur_validator_set_hash != cs.cur_validator_set_hash;
+        let new_next_validator_set_hash = TmHeaderVerifier::hash_validator_vec(&new_cs.next_validator_set)?;
+        let next_validator_set_hash = TmHeaderVerifier::hash_validator_vec(&cs.next_validator_set)?;
+        let validator_set_changed = new_cs.cur_validator_set_hash != cs.cur_validator_set_hash
+            || new_next_validator_set_hash != next_validator_set_hash;
         let cs_bytes = new_cs.encode()?;
         if validator_set_changed {
-            output.write(0, &[1_u8, 1]);
+            output.write(0, &[1_u8]);
         }
         let cs_len = cs_bytes.len() as u64;
         let mut height_bytes: [u8; 8] = [0; 8];
@@ -213,7 +216,7 @@ impl TmHeaderVerifier {
             })
             .collect();
 
-        let trust_next_validators_hash = simple_hash_from_byte_vectors(validator_bytes);
+        let trust_next_validators_hash = simple_hash_from_byte_vectors(validator_bytes)?;
         if light_block
             .signed_header
             .as_ref()
@@ -230,7 +233,7 @@ impl TmHeaderVerifier {
     }
     fn validator_sets_match(light_block: &LightBlock) -> Result<(), &'static str> {
         let validators_hash =
-            TmHeaderVerifier::hash_validator_set(&light_block.validator_set.as_ref().unwrap());
+            TmHeaderVerifier::hash_validator_set(&light_block.validator_set.as_ref().unwrap())?;
 
         if light_block
             .signed_header
@@ -249,7 +252,7 @@ impl TmHeaderVerifier {
 
     fn next_validators_match(light_block: &LightBlock) -> Result<(), &'static str> {
         let next_validators_hash =
-            TmHeaderVerifier::hash_validator_set(&light_block.next_validator_set.as_ref().unwrap());
+            TmHeaderVerifier::hash_validator_set(&light_block.next_validator_set.as_ref().unwrap())?;
 
         if light_block
             .signed_header
@@ -268,7 +271,7 @@ impl TmHeaderVerifier {
     }
 
     /// Compute the Merkle root of the validator set
-    fn hash_validator_set(validator_set: &ValidatorSet) -> Hash {
+    fn hash_validator_set(validator_set: &ValidatorSet) -> Result<Hash, &'static str> {
         let validator_bytes: Vec<Vec<u8>> = validator_set
             .validators
             .iter()
@@ -286,7 +289,25 @@ impl TmHeaderVerifier {
         simple_hash_from_byte_vectors(validator_bytes)
     }
 
-    fn hash_header(sh: &SignedHeader) -> Hash {
+    /// Compute the Merkle root of the validator vec
+    fn hash_validator_vec(validators: &Vec<Validator>) -> Result<Hash, &'static str> {
+        let validator_bytes: Vec<Vec<u8>> = validators
+            .iter()
+            .map(|validator| {
+                let mut wire = Vec::new();
+                Validator {
+                    pub_key: validator.pub_key.clone(),
+                    voting_power: validator.voting_power,
+                }
+                .encode(&mut wire)
+                .unwrap();
+                wire
+            })
+            .collect();
+        simple_hash_from_byte_vectors(validator_bytes)
+    }
+
+    fn hash_header(sh: &SignedHeader) -> Result<Hash, &'static str> {
         let header = sh.header.as_ref().unwrap();
         let mut fields_bytes: Vec<Vec<u8>> = Vec::with_capacity(14);
         fields_bytes.push({
@@ -432,7 +453,7 @@ impl TmHeaderVerifier {
     }
 
     fn header_matches_commit(signed_header: &SignedHeader) -> Result<(), &'static str> {
-        let header_hash = TmHeaderVerifier::hash_header(&signed_header);
+        let header_hash = TmHeaderVerifier::hash_header(&signed_header)?;
 
         if header_hash.to_vec()
             != signed_header
@@ -619,6 +640,9 @@ impl TmHeaderVerifier {
         })
     }
 
+    /// input:
+    /// consensus state length | consensus state | tendermint header |
+    /// 32 bytes               |                 |                   |
     fn decode_tendermint_header_validation_input(input: &[u8]) -> Result<HeaderCs, &'static str> {
         let cs_len = BigEndian::read_u64(
             &input[CONSENSUS_STATE_LENGTH_BYTES_LENGTH - UINT64_TYPE_LENGTH
@@ -626,7 +650,7 @@ impl TmHeaderVerifier {
         ) as usize;
         let input_length: usize = input.len();
         if input_length <= CONSENSUS_STATE_LENGTH_BYTES_LENGTH + cs_len {
-            panic!("invalid consensus length")
+            return Err("invalid consensus length");
         }
         let cs = TmHeaderVerifier::decode_consensus_state(
             &input
@@ -644,6 +668,9 @@ impl TmHeaderVerifier {
         return Ok(header);
     }
 
+    /// input:
+    /// | chainID   | height   | appHash  | curValidatorSetHash | [{validator pubkey, voting power}] |
+    /// | 32 bytes  | 8 bytes  | 32 bytes | 32 bytes            | [{32 bytes, 8 bytes}]              |
     fn decode_consensus_state(input: &[u8]) -> Result<ConsensusState, &'static str> {
         let minimum_length: usize =
             CHAIN_ID_LENGTH + HEIGHT_LENGTH + APP_HASH_LENGTH + VALIDATOR_SET_HASH_LENGTH;
@@ -724,6 +751,19 @@ mod test {
         let res = hex::encode(&data);
         assert!(valid.is_ok());
         assert_eq!(res,"000000000000000000000000000000000000000000000000000000000000022042696e616e63652d436861696e2d4e696c6500000000000000000000000000000000000003fc05e3a3e248bc209955054d880e4d89ff3c0419c0cd77681f4b4c6649ead5545054b980d9ab0fc10d18ca0e0832d5f4c063c5489ec1443dfb738252d038a82131b27ae17cbe9c20cdcfdf876b3b12978d3264a007fcaaa71c4cdb701d9ebc0323f44f000000174876e800184e7b103d34c41003f9b864d5f8c1adda9bd0436b253bb3c844bc739c1e77c9000000174876e8004d420aea843e92a0cfe69d89696dff6827769f9cb52a249af537ce89bf2a4b74000000174876e800bd03de9f8ab29e2800094e153fac6f696cfa512536c9c2f804dcb2c2c4e4aed6000000174876e8008f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d53000000174876e8004a5d4753eb79f92e80efe22df7aca4f666a4f44bf81c536c4a09d4b9c5b654b5000000174876e800c80e9abef7ff439c10c68fe8f1303deddfc527718c3b37d8ba6807446e3c827a000000174876e8009142afcc691b7cc05d26c7b0be0c8b46418294171730e079f384fde2fa50bafc000000174876e80049b288e4ebbb3a281c2d546fc30253d5baf08993b6e5d295fb787a5b314a298e000000174876e80004224339688f012e649de48e241880092eaa8f6aa0f4f14bfcf9e0c76917c0b6000000174876e8004034b37ceda8a0bf13b1abaeee7a8f9383542099a554d219b93d0ce69e3970e8000000174876e800");
+    }
+
+    #[test]
+    fn test_verify_execute2() {
+        let input = hex::decode("000000000000000000000000000000000000000000000000000000000000089000000000000000000000000000000000000000000000000000000000000000e042696e616e63652d436861696e2d47616e6765730000000000000000000000000000000000000001a25772e4ade1cca8d05c6dcf33a1287bf2ed23292ba85cc0562f2d56b5cb4d46aea1ac326886b992a991d21a6eb155f41b77867cbf659e78f31d89d8205122a84d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f60000000e8d4a5100099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d3000000e8d4a5100001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a612000000e8d4a510008e0f0af3080ab9020a02080a121442696e616e63652d436861696e2d47616e67657318e7d73c220b08b1d9def80510bbe3bc7130f0033a480a20b175c743bd8519f93680d993b57c7abff0fbb3dc64113273342bac71af5ab0cb1224080112205fb8db32cf079785abbeec7b8dd53378465e7bdfbc5cdf514193c461c36672e54220b359eeb33c77123f17b2f331238ff58f13bce0104327e3965d9ae0384ec9d83452201f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed5a201f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed6220294d8fbd0b94b767a7eba9840f299a3586da7fe6b5dead3b7eecba193c400f936a2007434a1b213c078ef70e4fc08ff009918637f1ea45a83dfd15532c8d3022846b820114f42f1d05ac568d12e26b9655395e7fbbd46bc5bb12b4060a480a2025b60c5d7db22a56c56da29fce9d5741cad07131fcef8be9b315b67165f296a7122408011220969407da4b5e72bb82f8c1287c0799b5855fb6884ed996a9ca5d9a5ff4f8e2f512b601080210e7d73c22480a2025b60c5d7db22a56c56da29fce9d5741cad07131fcef8be9b315b67165f296a7122408011220969407da4b5e72bb82f8c1287c0799b5855fb6884ed996a9ca5d9a5ff4f8e2f52a0c08b3d9def80510dab0979101321462633d9db7ed78e951f79913fdc8231aa77ec12b42403b6a43741c5530cd01f2a6df28d60551223bf1d78f8ccd9e852c13ac4aff65c503c199e33362273358c0d23be60823041b14e9902e7827364ac93a05a03fe20612b801080210e7d73c22480a2025b60c5d7db22a56c56da29fce9d5741cad07131fcef8be9b315b67165f296a7122408011220969407da4b5e72bb82f8c1287c0799b5855fb6884ed996a9ca5d9a5ff4f8e2f52a0c08b3d9def80510b6d782980132149ccddd479c0ad8dcd01d754dd95fe15384e8bbdc38014240d01ad6bd8f7abbb71039961c0970fdbc33705760a6ed644aa3976faade48dc1a7e27fed392346d7f636d68c7dbfa3ffbd2128aec21a2682abed54daf4799540512b801080210e7d73c22480a2025b60c5d7db22a56c56da29fce9d5741cad07131fcef8be9b315b67165f296a7122408011220969407da4b5e72bb82f8c1287c0799b5855fb6884ed996a9ca5d9a5ff4f8e2f52a0c08b3d9def805109df9e691013214d4cecef238e778c7063552c3a7ab95da35c3fb4738024240f812961452eb84eea9ff8c856b0af9d080c833a53233aac70564744cfa82d1ea5e6126d1a47bf22c027a82fdd193d143f981e4ea7c65169fbd423778e073500812b801080210e7d73c22480a2025b60c5d7db22a56c56da29fce9d5741cad07131fcef8be9b315b67165f296a7122408011220969407da4b5e72bb82f8c1287c0799b5855fb6884ed996a9ca5d9a5ff4f8e2f52a0c08b3d9def80510efbcbd98013214f42f1d05ac568d12e26b9655395e7fbbd46bc5bb3803424041e973cd7ab08db7deeb29b043d35a798e976662d3340ba2d4d0abd16cd17769690cd9e013e081a00380211481f845a49556dd106f0f5ee9d7f23d52111df80e1289030a4f0a1462633d9db7ed78e951f79913fdc8231aa77ec12b12251624de64208f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d531880a094a58d1d2080a0c390d8a8ffffff010a4b0a149ccddd479c0ad8dcd01d754dd95fe15384e8bbdc12251624de64204d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f601880a094a58d1d2080a094a58d1d0a4b0a14d4cecef238e778c7063552c3a7ab95da35c3fb4712251624de642099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d31880a094a58d1d2080a094a58d1d0a4b0a14f42f1d05ac568d12e26b9655395e7fbbd46bc5bb12251624de642001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a6121880a094a58d1d2080a094a58d1d124f0a1462633d9db7ed78e951f79913fdc8231aa77ec12b12251624de64208f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d531880a094a58d1d2080a0c390d8a8ffffff011a89030a4f0a1462633d9db7ed78e951f79913fdc8231aa77ec12b12251624de64208f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d531880a094a58d1d2080a0c390d8a8ffffff010a4b0a149ccddd479c0ad8dcd01d754dd95fe15384e8bbdc12251624de64204d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f601880a094a58d1d2080a094a58d1d0a4b0a14d4cecef238e778c7063552c3a7ab95da35c3fb4712251624de642099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d31880a094a58d1d2080a094a58d1d0a4b0a14f42f1d05ac568d12e26b9655395e7fbbd46bc5bb12251624de642001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a6121880a094a58d1d2080a094a58d1d124f0a1462633d9db7ed78e951f79913fdc8231aa77ec12b12251624de64208f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d531880a094a58d1d2080a0c390d8a8ffffff01").unwrap();
+
+        let mut data = vec![];
+
+        let valid = TmHeaderVerifier::execute(&input[..], &mut BytesRef::Flexible(&mut data));
+        let res = hex::encode(&data);
+        assert!(valid.is_ok());
+        // assert_eq!(res,"01010000000000000000000000000000000000000000000000000000000000e042696e616e63652d436861696e2d47616e67657300000000000000000000000000000000000f2be707434a1b213c078ef70e4fc08ff009918637f1ea45a83dfd15532c8d3022846b1f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed4d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f60000000e8d4a5100099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d3000000e8d4a5100001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a612000000e8d4a51000");
+        assert_eq!(res,"010000000000000000000000000000000000000000000000000000000000010842696e616e63652d436861696e2d47616e67657300000000000000000000000000000000000f2be707434a1b213c078ef70e4fc08ff009918637f1ea45a83dfd15532c8d3022846b1f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed8f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d53000000e8d4a510004d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f60000000e8d4a5100099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d3000000e8d4a5100001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a612000000e8d4a51000");
     }
     #[test]
     fn test_decode_encode() {

@@ -12,32 +12,32 @@ pub type Hash = [u8; HASH_SIZE];
 /// Compute a simple Merkle root from vectors of arbitrary byte vectors.
 /// The leaves of the tree are the bytes of the given byte vectors in
 /// the given order.
-pub fn simple_hash_from_byte_vectors(byte_vecs: Vec<Vec<u8>>) -> Hash {
+pub fn simple_hash_from_byte_vectors(byte_vecs: Vec<Vec<u8>>) -> Result<Hash, &'static str> {
     simple_hash_from_byte_slices_inner(byte_vecs.as_slice())
 }
 
 // recurse into subtrees
-fn simple_hash_from_byte_slices_inner(byte_slices: &[Vec<u8>]) -> Hash {
+fn simple_hash_from_byte_slices_inner(byte_slices: &[Vec<u8>]) -> Result<Hash, &'static str> {
     let length = byte_slices.len();
     match length {
-        0 => empty_hash(),
-        1 => leaf_hash(byte_slices[0].as_slice()),
+        0 => Ok(empty_hash()),
+        1 => Ok(leaf_hash(byte_slices[0].as_slice())),
         _ => {
-            let k = get_split_point(length);
-            let left = simple_hash_from_byte_slices_inner(&byte_slices[..k]);
-            let right = simple_hash_from_byte_slices_inner(&byte_slices[k..]);
-            inner_hash(&left, &right)
+            let k = get_split_point(length)?;
+            let left = simple_hash_from_byte_slices_inner(&byte_slices[..k])?;
+            let right = simple_hash_from_byte_slices_inner(&byte_slices[k..])?;
+            Ok(inner_hash(&left, &right))
         }
     }
 }
 
 // returns the largest power of 2 less than length
-fn get_split_point(length: usize) -> usize {
+fn get_split_point(length: usize) -> Result<usize, &'static str> {
     match length {
-        0 => panic!("tree is empty!"),
-        1 => panic!("tree has only one element!"),
-        2 => 1,
-        _ => length.next_power_of_two() / 2,
+        0 => Err("tree is empty!"),
+        1 => Err("tree has only one element!"),
+        2 => Ok(1),
+        _ => Ok(length.next_power_of_two() / 2),
     }
 }
 
@@ -95,16 +95,16 @@ mod tests {
 
     #[test]
     fn test_get_split_point() {
-        assert_eq!(get_split_point(2), 1);
-        assert_eq!(get_split_point(3), 2);
-        assert_eq!(get_split_point(4), 2);
-        assert_eq!(get_split_point(5), 4);
-        assert_eq!(get_split_point(10), 8);
-        assert_eq!(get_split_point(20), 16);
-        assert_eq!(get_split_point(100), 64);
-        assert_eq!(get_split_point(255), 128);
-        assert_eq!(get_split_point(256), 128);
-        assert_eq!(get_split_point(257), 256);
+        assert_eq!(get_split_point(2), Ok(1));
+        assert_eq!(get_split_point(3), Ok(2));
+        assert_eq!(get_split_point(4), Ok(2));
+        assert_eq!(get_split_point(5), Ok(4));
+        assert_eq!(get_split_point(10), Ok(8));
+        assert_eq!(get_split_point(20), Ok(16));
+        assert_eq!(get_split_point(100), Ok(64));
+        assert_eq!(get_split_point(255), Ok(128));
+        assert_eq!(get_split_point(256), Ok(128));
+        assert_eq!(get_split_point(257), Ok(256));
     }
 
     #[test]
@@ -114,7 +114,7 @@ mod tests {
         let empty_tree_root = &hex::decode(empty_tree_root_hex).unwrap();
         let empty_tree: Vec<Vec<u8>> = vec![vec![]; 0];
 
-        let root = simple_hash_from_byte_vectors(empty_tree);
+        let root = simple_hash_from_byte_vectors(empty_tree).unwrap();
         assert_eq!(empty_tree_root, &root);
     }
 
@@ -125,7 +125,7 @@ mod tests {
         let empty_leaf_root = &hex::decode(empty_leaf_root_hex).unwrap();
         let one_empty_leaf: Vec<Vec<u8>> = vec![vec![]; 1];
 
-        let root = simple_hash_from_byte_vectors(one_empty_leaf);
+        let root = simple_hash_from_byte_vectors(one_empty_leaf).unwrap();
         assert_eq!(empty_leaf_root, &root);
     }
 
@@ -137,7 +137,7 @@ mod tests {
         let leaf_root = &hex::decode(leaf_root_hex).unwrap();
         let leaf_tree: Vec<Vec<u8>> = vec![leaf_string.as_bytes().to_vec(); 1];
 
-        let root = simple_hash_from_byte_vectors(leaf_tree);
+        let root = simple_hash_from_byte_vectors(leaf_tree).unwrap();
         assert_eq!(leaf_root, &root);
     }
 
