@@ -637,7 +637,7 @@ mod test {
             &input[..],
             &mut BytesRef::Fixed(&mut output[..]),
             false,
-            true,
+            false,
             false,
         );
         assert!(valid.is_ok())
