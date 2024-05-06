@@ -6,6 +6,9 @@ use crate::{
 };
 use bstr::ByteSlice;
 use byteorder::{BigEndian, ReadBytesExt};
+use ics23::{
+    calculate_existence_root, iavl_spec, tendermint_spec, verify_membership, CommitmentProof,
+};
 use parity_bytes::BytesRef;
 use prost_amino::{encoding::encode_varint, Message as _};
 use serde::{Deserialize, Serialize};
@@ -171,6 +174,10 @@ trait ProofExecute {
     fn run(&self, value: Vec<u8>, key: Vec<u8>) -> Result<Hash, &'static str>;
 }
 
+trait ProofExecuteMoran {
+    fn run_moran(&self, value: Vec<u8>, key: Vec<u8>) -> Result<Hash, &'static str>;
+}
+
 struct RangeProofVerifier {
     proof: RangeProof,
 }
@@ -205,7 +212,7 @@ impl MultiStoreProofVerifier {
                     .as_slice(),
             );
             let mut store_hash = [0u8; SHA256_HASH_SIZE];
-            store_hash.copy_from_slice(&tmp_hash);
+            store_hash.copy_from_slice(&tmp_hash.as_slice());
             kvs.push(KVPair {
                 key: store.name.clone().into_bytes(),
                 value: store_hash.to_vec(),
@@ -237,6 +244,19 @@ impl MultiStoreProofVerifier {
 }
 
 impl RangeProofVerifier {
+    fn verify_item_moran(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), &'static str> {
+        let leaves = &self.proof.leaves;
+        if leaves.len() != 1 {
+            return Err("range proof suspended");
+        }
+        for inner_node in &self.proof.left_path {
+            if inner_node.left.len() > 0 && inner_node.right.len() > 0 {
+                return Err("both right and left hash exist!");
+            }
+        }
+        return self.verify_item(key, value);
+    }
+
     fn verify_item(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), &'static str> {
         let leaves = &self.proof.leaves;
         let i = match leaves.binary_search_by(|probe| probe.key.cmp(&key)) {
@@ -325,6 +345,17 @@ impl ProofExecute for IavlValueProofOp {
     }
 }
 
+impl ProofExecuteMoran for IavlValueProofOp {
+    fn run_moran(&self, value: Vec<u8>, key: Vec<u8>) -> Result<Hash, &'static str> {
+        let mut verifier = RangeProofVerifier {
+            proof: self.proof.as_ref().unwrap().clone(),
+        };
+        let root_hash = verifier.compute_root_hash()?;
+        verifier.verify_item_moran(key, value)?;
+        return Ok(root_hash);
+    }
+}
+
 impl ProofExecute for MultiStoreProofOp {
     fn run(&self, value: Vec<u8>, key: Vec<u8>) -> Result<Hash, &'static str> {
         let mut verifier = MultiStoreProofVerifier {
@@ -343,6 +374,46 @@ impl ProofExecute for MultiStoreProofOp {
     }
 }
 
+/// ICS23 commiement op.
+#[derive(Clone, Debug)]
+pub struct CommitmentProofOp {
+    /// Type
+    pub field_type: String,
+    /// Proof
+    pub proof: CommitmentProof,
+}
+
+impl ProofExecute for CommitmentProofOp {
+    fn run(&self, value: Vec<u8>, key: Vec<u8>) -> Result<Hash, &'static str> {
+        let spec = match self.field_type.as_str() {
+            "ics23:iavl" => iavl_spec(),
+            "ics23:simple" => tendermint_spec(),
+            _ => return Err("unexpected ProofOp.Type"),
+        };
+
+        let existence = match self.proof.proof.clone() {
+            Some(p) => match p {
+                ics23::commitment_proof::Proof::Exist(e) => e,
+                _ => return Err("only exist proof supported"),
+            },
+            None => return Err("invalid merkle proof"),
+        };
+
+        let root = match calculate_existence_root(&existence) {
+            Ok(r) => r,
+            _ => return Err("cannot calculate root for poof"),
+        };
+        let result = verify_membership(&self.proof, &spec, &root, &key, &value);
+        if !result {
+            return Err("proof cannot be verified for exsitence");
+        }
+
+        let mut hash: [u8; 32] = [0; 32];
+        hash[0..32].copy_from_slice(&root);
+        return Ok(hash);
+    }
+}
+
 struct KeyValueMerkleProof {
     key: Vec<u8>,
     value: Vec<u8>,
@@ -352,7 +423,7 @@ struct KeyValueMerkleProof {
 }
 
 impl KeyValueMerkleProof {
-    fn validate(&self) -> bool {
+    fn validate(&self, is_moran: bool) -> bool {
         if self.value.len() == 0 {
             return false;
         }
@@ -366,11 +437,14 @@ impl KeyValueMerkleProof {
             return false;
         }
         let iavl_proof = IavlValueProofOp::decode_length_delimited(&iavl_op.data[..]).unwrap();
-        let iavl_hash: Result<Hash, &'static str> =
-            iavl_proof.run(self.value.clone(), self.key.clone());
+        let iavl_hash = match is_moran {
+            true => iavl_proof.run_moran(self.value.clone(), self.key.clone()),
+            false => iavl_proof.run(self.value.clone(), self.key.clone()),
+        };
         if iavl_hash.is_err() {
             return false;
         }
+
         let mul_op = self.proof.ops.get(1).unwrap();
         if mul_op.field_type != "multistore" {
             return false;
@@ -382,6 +456,55 @@ impl KeyValueMerkleProof {
             return false;
         }
         if mul_root_hash.unwrap().to_vec() != self.app_hash {
+            return false;
+        }
+        return true;
+    }
+
+    fn validate_ics23(&self) -> bool {
+        if self.value.len() == 0 {
+            return false;
+        }
+        // expect multi store and iavl store
+        if self.proof.ops.len() != 2 {
+            return false;
+        }
+
+        let iavl_op = self.proof.ops.get(0).unwrap();
+        if iavl_op.field_type != "ics23:iavl" {
+            return false;
+        }
+        let iavl_commitment =
+            <CommitmentProof as prost::Message>::decode(&iavl_op.data[..]).unwrap();
+
+        let iavl_commitment_proof = CommitmentProofOp {
+            field_type: iavl_op.field_type.clone(),
+            proof: iavl_commitment,
+        };
+        let iavl_root_hash: Result<Hash, &'static str> =
+            iavl_commitment_proof.run(self.value.clone(), self.key.clone());
+        if iavl_root_hash.is_err() {
+            return false;
+        }
+
+        let simple_op = self.proof.ops.get(1).unwrap();
+        if simple_op.field_type != "ics23:simple" {
+            return false;
+        }
+        let simple_commitment =
+            <CommitmentProof as prost::Message>::decode(&simple_op.data[..]).unwrap();
+
+        let simple_commitment_proof = CommitmentProofOp {
+            field_type: simple_op.field_type.clone(),
+            proof: simple_commitment,
+        };
+        let simple_root_hash: Result<Hash, &'static str> =
+            simple_commitment_proof.run(iavl_root_hash.unwrap().to_vec(), self.store_name.clone());
+        if simple_root_hash.is_err() {
+            return false;
+        }
+
+        if simple_root_hash.unwrap().to_vec() != self.app_hash {
             return false;
         }
         return true;
@@ -446,7 +569,27 @@ fn decode_key_value_merkle_proof(input: &[u8]) -> Result<KeyValueMerkleProof, &'
     })
 }
 /// Iavl proof verification
-pub fn execute(input: &[u8], output: &mut BytesRef) -> Result<(), &'static str> {
+pub fn execute(
+    input: &[u8],
+    output: &mut BytesRef,
+    is_moran: bool,
+    is_planck: bool,
+    is_plato: bool,
+) -> Result<(), &'static str> {
+    let mut count = 0;
+    if is_moran {
+        count += 1;
+    }
+    if is_planck {
+        count += 1;
+    }
+    if is_plato {
+        count += 1;
+    }
+    if count > 1 {
+        return Err("at most one of is_moran, is_plank, is_plato can be true");
+    }
+
     if input.len() <= PRECOMPILE_CONTRACT_INPUT_METADATA_LENGTH {
         return Err("invalid input: input should include 32 bytes payload length and payload");
     }
@@ -457,7 +600,18 @@ pub fn execute(input: &[u8], output: &mut BytesRef) -> Result<(), &'static str> 
         return Err("invalid input: input size do not match");
     }
     let kvmp = decode_key_value_merkle_proof(&input[PRECOMPILE_CONTRACT_INPUT_METADATA_LENGTH..])?;
-    let valid = kvmp.validate();
+
+    let valid: bool;
+    if is_plato {
+        valid = kvmp.validate_ics23();
+    } else if is_planck {
+        valid = kvmp.validate_ics23() || kvmp.validate(true);
+    } else if is_moran {
+        valid = kvmp.validate(true);
+    } else {
+        valid = kvmp.validate(false);
+    }
+
     if !valid {
         return Err("invalid merkle proof");
     }
@@ -479,7 +633,13 @@ mod test {
 
         let mut output = [0u8; 32];
 
-        let valid = execute(&input[..], &mut BytesRef::Fixed(&mut output[..]));
+        let valid = execute(
+            &input[..],
+            &mut BytesRef::Fixed(&mut output[..]),
+            false,
+            true,
+            false,
+        );
         assert!(valid.is_ok())
     }
 
