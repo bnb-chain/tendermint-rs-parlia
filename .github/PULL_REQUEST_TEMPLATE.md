@@ -1,18 +1,21 @@
-<!--
+### Description
 
-Thanks for filing a PR!
+add a description of your changes here...
 
-Before hitting the button, please check the following items.  Please note that
-every non-trivial PR must reference an issue that explains the changes in the
-PR.
+### Rationale
 
-Please also make sure you've targeted the correct branch with your PR. See the
-contributing guidelines for details.
+tell us why we need these changes...
 
--->
+### Example
 
-* [ ] Referenced an issue explaining the need for the change
-* [ ] Updated all relevant documentation in docs
-* [ ] Updated all code comments where relevant
-* [ ] Wrote tests
-* [ ] Added entry in `.changelog/`
+add an example CLI or API response...
+
+### Changes
+
+Notable changes:
+* add each change in a bullet point here
+* ...
+
+### Potential Impacts
+* add potential impacts for other components here
+* ...
