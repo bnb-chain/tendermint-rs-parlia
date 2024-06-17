@@ -30,6 +30,6 @@ impl Hasher for ProdHasher {
             .map(|validator| validator.hash_bytes())
             .collect();
 
-        Hash::Sha256(merkle::simple_hash_from_byte_vectors(validator_bytes))
+        Hash::Sha256(merkle::simple_hash_from_byte_vectors(validator_bytes).unwrap())
     }
 }
