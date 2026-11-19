@@ -12,7 +12,7 @@ use prost_amino::Message as _;
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, convert::TryInto};
 use tendermint_proto::crypto::{
-    CanonicalBlockId, CanonicalPartSetHeader, CanonicalVote as RawCanonicalVote, Commit, CommitSig,
+    CanonicalBlockId, CanonicalPartSetHeader, CanonicalVote as RawCanonicalVote, CommitSig,
     LightBlock, SignedHeader, ValidatorSet,
 };
 
@@ -26,6 +26,8 @@ const VALIDATOR_SET_HASH_LENGTH: usize = 32;
 const APP_HASH_LENGTH: usize = 32;
 const VALIDATOR_PUBKEY_LENGTH: usize = 32;
 const VALIDATOR_VOTING_POWER_LENGTH: usize = 8;
+// go-tendermint `types.MaxTotalVotingPower`.
+const MAX_TOTAL_VOTING_POWER: i64 = i64::MAX / 8;
 const MAX_CONSENSUS_STATE_LENGTH: usize = 32 * (128 - 1);
 
 #[derive(
@@ -49,6 +51,17 @@ struct ConsensusState {
 struct HeaderCs {
     cs: ConsensusState,
     header: LightBlock,
+}
+
+/// How a commit signature is matched to the validator that signed it.
+#[derive(Clone, Copy)]
+enum SignerLookup {
+    /// Signature i belongs to validator i of the set the commit is for (go-tendermint
+    /// `VerifyCommit`).
+    Slot,
+    /// Match `CommitSig.validator_address` against the address derived from each public key
+    /// (go-tendermint `VerifyFutureCommit` counting the old validator set).
+    Address,
 }
 
 impl ConsensusState {
@@ -152,6 +165,7 @@ impl TmHeaderVerifier {
             TmHeaderVerifier::verify_sufficient_validators_overlap(
                 &header.signed_header.as_ref().unwrap(),
                 &cs.next_validator_set,
+                SignerLookup::Address,
             )?;
         }
 
@@ -312,7 +326,9 @@ impl TmHeaderVerifier {
         let mut fields_bytes: Vec<Vec<u8>> = Vec::with_capacity(14);
         fields_bytes.push({
             let mut wire = Vec::new();
-            header.version.as_ref().unwrap().encode(&mut wire).unwrap();
+            // Go's Header.Version is a value, so an omitted message means the
+            // zero consensus version. Hash that value rather than rejecting it.
+            header.version.clone().unwrap_or_default().encode(&mut wire).unwrap();
             wire
         });
         fields_bytes.push({
@@ -474,9 +490,10 @@ impl TmHeaderVerifier {
         signed_header: &SignedHeader,
         validators: &ValidatorSet,
     ) -> Result<(), &'static str> {
-        TmHeaderVerifier::valid_commit_basic(signed_header, validators)?;
-        TmHeaderVerifier::validate_commit_full(signed_header, validators)?;
-        Ok(())
+        // Signatures are bound to validators by slot in verify_sufficient_signers_overlap. The
+        // addresses carried by the validator set and by each CommitSig are neither hashed nor
+        // signed, so go-tendermint never checks them against each other here.
+        TmHeaderVerifier::valid_commit_basic(signed_header, validators)
     }
 
     fn valid_commit_basic(
@@ -489,29 +506,6 @@ impl TmHeaderVerifier {
         if signatures.len() != validator_set.validators.len() {
             return Err("pre-commit length doesn't match validator length");
         }
-        Ok(())
-    }
-
-    fn validate_commit_full(
-        signed_header: &SignedHeader,
-        validator_set: &ValidatorSet,
-    ) -> Result<(), &'static str> {
-        for commit_sig in signed_header.commit.as_ref().unwrap().signatures.iter() {
-            let validator_address = &commit_sig.validator_address;
-            if validator_address.is_empty() {
-                continue;
-            }
-            if validator_set
-                .validators
-                .iter()
-                .find(|val| &val.address == validator_address)
-                .cloned()
-                == None
-            {
-                return Err("Found a faulty signer not present in the validator set ");
-            }
-        }
-
         Ok(())
     }
 
@@ -529,9 +523,12 @@ impl TmHeaderVerifier {
                 voting_power: v.voting_power as u64,
             })
         }
+        // The commit is for this validator set, so signature i belongs to validator i, as in
+        // go-tendermint's VerifyCommit.
         TmHeaderVerifier::verify_sufficient_validators_overlap(
             &untrusted_sh.signed_header.as_ref().unwrap(),
             &vals,
+            SignerLookup::Slot,
         )?;
         Ok(())
     }
@@ -539,45 +536,56 @@ impl TmHeaderVerifier {
     fn verify_sufficient_validators_overlap(
         signed_header: &SignedHeader,
         validator_set: &Vec<Validator>,
+        lookup: SignerLookup,
     ) -> Result<(), &'static str> {
         let signatures = &signed_header.commit.as_ref().unwrap().signatures;
         let chain_id = signed_header.header.as_ref().unwrap().chain_id.to_string();
 
-        let mut tallied_voting_power = 0_u64;
+        // Voting power is a signed int64 in the Go client; `Validator::voting_power` holds the same
+        // bits as u64. Tally in i64 with Go's wrapping `+=` so the quorum check matches go-bsc.
+        let mut tallied_voting_power = 0_i64;
         let mut seen_validators = HashSet::new();
-        let non_absent_votes = signatures.iter().enumerate().flat_map(|(_, signature)| {
-            if let Some(vote) = TmHeaderVerifier::non_absent_vote(
-                signature,
-                chain_id.clone(),
-                &signed_header.commit.as_ref().unwrap(),
-            ) {
-                Some((signature, vote))
-            } else {
-                None
-            }
-        });
+        let non_absent_votes = signatures
+            .iter()
+            .enumerate()
+            .flat_map(|(index, signature)| {
+                if let Some(vote) = TmHeaderVerifier::non_absent_vote(signature, chain_id.clone()) {
+                    Some((index, signature, vote))
+                } else {
+                    None
+                }
+            });
 
-        for (signature, vote) in non_absent_votes {
-            // Ensure we only count a validator's power once
-            let addr_id: AccountId = signature.validator_address.clone().try_into().unwrap();
-            if !seen_validators.contains(&addr_id) {
-                seen_validators.insert(addr_id);
-            } else {
-                return Err("Duplicate Validator");
-            }
+        for (index, signature, vote) in non_absent_votes {
+            let validator = match lookup {
+                SignerLookup::Slot => match validator_set.get(index) {
+                    Some(validator) => validator.clone(),
+                    None => return Err("pre-commit length doesn't match validator length"),
+                },
+                SignerLookup::Address => {
+                    // Ensure we only count a validator's power once
+                    let addr_id: AccountId =
+                        signature.validator_address.clone().try_into().unwrap();
+                    if !seen_validators.contains(&addr_id) {
+                        seen_validators.insert(addr_id);
+                    } else {
+                        return Err("Duplicate Validator");
+                    }
 
-            let validator = match validator_set
-                .iter()
-                .find(|val| {
-                    let digest = Sha256::digest(&val.pub_key);
-                    let mut hash_bytes = [0u8; SHA256_HASH_SIZE];
-                    hash_bytes.copy_from_slice(&digest);
-                    hash_bytes[..20].to_vec() == signature.validator_address.clone()
-                })
-                .cloned()
-            {
-                Some(validator) => validator,
-                None => continue, // Cannot find matching validator, so we skip the vote
+                    match validator_set
+                        .iter()
+                        .find(|val| {
+                            let digest = Sha256::digest(&val.pub_key);
+                            let mut hash_bytes = [0u8; SHA256_HASH_SIZE];
+                            hash_bytes.copy_from_slice(&digest);
+                            hash_bytes[..20].to_vec() == signature.validator_address.clone()
+                        })
+                        .cloned()
+                    {
+                        Some(validator) => validator,
+                        None => continue, // Cannot find matching validator, so we skip the vote
+                    }
+                }
             };
 
             // Check vote is valid
@@ -592,50 +600,77 @@ impl TmHeaderVerifier {
                 )
                 .is_err()
             {
-                continue;
+                return Err("Invalid commit signature");
             }
 
-            tallied_voting_power += validator.voting_power;
+            // Valid stray precommits (including nil votes) measure availability,
+            // but only votes for the committed BlockID contribute to its quorum.
+            if signature.block_id == signed_header.commit.as_ref().unwrap().block_id {
+                tallied_voting_power =
+                    tallied_voting_power.wrapping_add(validator.voting_power as i64);
+            }
         }
 
-        let total_voting_power = validator_set
-            .iter()
-            .fold(0u64, |total, val_info| total + val_info.voting_power);
+        TmHeaderVerifier::verify_voting_power_quorum(tallied_voting_power, validator_set)
+    }
 
-        if tallied_voting_power * 3 <= total_voting_power * 2 {
+    /// Two-thirds quorum check with the integer semantics of go-tendermint v0.31
+    /// `ValidatorSet.VerifyCommit` / `VerifyFutureCommit`, which go-bsc uses for this precompile.
+    /// The total is a saturating (`safeAddClip`) int64 sum that must not exceed
+    /// `MAX_TOTAL_VOTING_POWER` at any step (go panics there, and the precompile recovers it into
+    /// an error). The commit passes iff `tallied > total*2/3`, where `*` wraps and `/` truncates
+    /// toward zero, as in Go.
+    fn verify_voting_power_quorum(
+        tallied_voting_power: i64,
+        validator_set: &[Validator],
+    ) -> Result<(), &'static str> {
+        let mut total_voting_power = 0_i64;
+        for validator in validator_set {
+            total_voting_power = total_voting_power.saturating_add(validator.voting_power as i64);
+            if total_voting_power > MAX_TOTAL_VOTING_POWER {
+                return Err("Total voting power exceeds the limit");
+            }
+        }
+
+        if tallied_voting_power <= total_voting_power.wrapping_mul(2) / 3 {
             return Err("No enough voting power");
         }
 
         Ok(())
     }
 
-    fn non_absent_vote(
-        commit_sig: &CommitSig,
-        chain_id: String,
-        commit: &Commit,
-    ) -> Option<RawCanonicalVote> {
+    fn non_absent_vote(commit_sig: &CommitSig, chain_id: String) -> Option<RawCanonicalVote> {
         if commit_sig.vote_type != 2 {
             return None;
         }
-        let timestamp = &commit_sig.timestamp;
-        let block_id = &commit.block_id.as_ref().unwrap();
-        let mut h = [0u8; SHA256_HASH_SIZE];
-        h.copy_from_slice(&block_id.hash.as_slice());
-        let mut ph = [0u8; SHA256_HASH_SIZE];
-        ph.copy_from_slice(&block_id.part_set_header.as_ref().unwrap().hash.as_slice());
-        let p = CanonicalPartSetHeader {
-            total: block_id.part_set_header.as_ref().unwrap().total,
-            hash: ph.to_vec(),
+        // Legacy CommitSig carries its own BlockID. The outer commit identifies
+        // the quorum's block, not necessarily the block this validator signed.
+        // Amino omits Go's zero-value nested structs. Normalize absent and
+        // explicitly empty BlockIDs to the same nil-vote signing bytes.
+        let block_id = commit_sig.block_id.clone().unwrap_or_default();
+        let parts = block_id.part_set_header.unwrap_or_default();
+        let canonical_parts = if parts.total == 0 && parts.hash.is_empty() {
+            None
+        } else {
+            Some(CanonicalPartSetHeader {
+                total: parts.total,
+                hash: parts.hash,
+            })
+        };
+        let canonical_block = if block_id.hash.is_empty() && canonical_parts.is_none() {
+            None
+        } else {
+            Some(CanonicalBlockId {
+                hash: block_id.hash,
+                part_set_header: canonical_parts,
+            })
         };
         Some(RawCanonicalVote {
             signed_msg_type: commit_sig.vote_type,
             height: commit_sig.height,
             round: commit_sig.round as i64,
-            block_id: Some(CanonicalBlockId {
-                hash: h.to_vec(),
-                part_set_header: Some(p),
-            }),
-            timestamp: timestamp.clone(),
+            block_id: canonical_block,
+            timestamp: commit_sig.timestamp.clone(),
             chain_id,
         })
     }
@@ -735,7 +770,7 @@ impl TmHeaderVerifier {
 
 #[cfg(test)]
 mod test {
-    use crate::lite::light_client::TmHeaderVerifier;
+    use crate::lite::light_client::{TmHeaderVerifier, Validator, MAX_TOTAL_VOTING_POWER};
     use parity_bytes::BytesRef;
     use prost_amino::Message as _;
 
@@ -765,6 +800,56 @@ mod test {
         // assert_eq!(res,"01010000000000000000000000000000000000000000000000000000000000e042696e616e63652d436861696e2d47616e67657300000000000000000000000000000000000f2be707434a1b213c078ef70e4fc08ff009918637f1ea45a83dfd15532c8d3022846b1f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed4d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f60000000e8d4a5100099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d3000000e8d4a5100001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a612000000e8d4a51000");
         assert_eq!(res,"010000000000000000000000000000000000000000000000000000000000010842696e616e63652d436861696e2d47616e67657300000000000000000000000000000000000f2be707434a1b213c078ef70e4fc08ff009918637f1ea45a83dfd15532c8d3022846b1f3afc06a1aec5ae1efbd9081437bd3b4af39d80e1a8cb087a0c04d80e2f27ed8f4a74a07351895ddf373057b98fae6dfaf2cd21f37a063e19601078fe470d53000000e8d4a510004d1be64f0e9a466c2e66a53433928192783e29f8fa21beb2133499b5ef770f60000000e8d4a5100099308aa365c40554bc89982af505d85da95251445d5dd4a9bb37dd2584fd92d3000000e8d4a5100001776920ff0b0f38d78cf95c033c21adf7045785114e392a7544179652e0a612000000e8d4a51000");
     }
+
+    fn validators(powers: &[i64]) -> Vec<Validator> {
+        powers
+            .iter()
+            .map(|power| Validator {
+                pub_key: vec![0u8; 32],
+                voting_power: *power as u64,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_voting_power_quorum_matches_go() {
+        let quorum = |tallied: i64, powers: &[i64]| {
+            TmHeaderVerifier::verify_voting_power_quorum(tallied, &validators(powers))
+        };
+        let no_quorum = Err("No enough voting power");
+        let over_limit = Err("Total voting power exceeds the limit");
+
+        // Ordinary sets: tallied must be strictly more than two thirds.
+        assert!(quorum(21, &[10, 10, 10]).is_ok());
+        assert_eq!(quorum(20, &[10, 10, 10]), no_quorum);
+
+        // A single validator with power MinInt64+1 used to wrap the u64 quorum product and pass.
+        // In Go, total*2 wraps to 2, 2/3 == 0 and the negative tally is not above it.
+        assert_eq!(quorum(i64::MIN + 1, &[i64::MIN + 1]), no_quorum);
+
+        // Go panics (recovered into an error) once any prefix of the total exceeds
+        // MaxTotalVotingPower, even when the set is positive and has a real quorum.
+        assert_eq!(quorum(1 << 61, &[1 << 61]), over_limit);
+        assert_eq!(quorum(1 << 61, &[1 << 61, -(1 << 61)]), over_limit);
+        assert!(quorum(MAX_TOTAL_VOTING_POWER, &[MAX_TOTAL_VOTING_POWER]).is_ok());
+
+        // Go accepts some sets containing negative power: total 5, 5*2/3 == 3, 10 > 3.
+        assert!(quorum(10, &[10, -5]).is_ok());
+        // Go's division truncates toward zero: total -1, -2/3 == 0, so a zero tally fails.
+        assert_eq!(quorum(0, &[-1]), no_quorum);
+        assert!(quorum(1, &[-1]).is_ok());
+    }
+
+    #[test]
+    fn test_negative_voting_power_commit_rejected() {
+        // One genuine signature from a validator with voting power MinInt64+1.
+        let input = hex::decode("000000000000000000000000000000000000000000000000000000000000047e00000000000000000000000000000000000000000000000000000000000000906e656761746976652d706f77657200000000000000000000000000000000000000000000000000014141414141414141414141414141414141414141414141414141414141414141d4789cb15f48301c04d1a4d612d84f077098d9af918214ef466395314edfb4ad337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d98000000000000001cc070a9b050a94030a02080a120e6e656761746976652d706f7765721802220b0880e2cfaa0610c0a9d33a3a480a2011111111111111111111111111111111111111111111111111111111111111111224080112201212121212121212121212121212121212121212121212121212121212121212422021212121212121212121212121212121212121212121212121212121212121214a2022222222222222222222222222222222222222222222222222222222222222225220d4789cb15f48301c04d1a4d612d84f077098d9af918214ef466395314edfb4ad5a20d4789cb15f48301c04d1a4d612d84f077098d9af918214ef466395314edfb4ad622023232323232323232323232323232323232323232323232323232323232323236a202424242424242424242424242424242424242424242424242424242424242424722025252525252525252525252525252525252525252525252525252525252525257a20262626262626262626262626262626262626262626262626262626262626262682011403d316adf68403b37ba6d766b08516b828ceedf81281020a480a209f74181f2a0a5fbae7a20b6b70add4e7ad81c6891efdaed13ca88faa64e8a470122408011220313131313131313131313131313131313131313131313131313131313131313112b4010802100222480a209f74181f2a0a5fbae7a20b6b70add4e7ad81c6891efdaed13ca88faa64e8a47012240801122031313131313131313131313131313131313131313131313131313131313131312a0c0881e2cfaa06108084b8d901321403d316adf68403b37ba6d766b08516b828ceedf842403e268e276ad65757475a164be37ecff3dd5325316e7dd05af4dd0c3c8ddd8048c13c3a311b84df7a0a58d3271c60dd5543d999c614e5048dc56a61b3aa87e6011294010a480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d9188180808080808080800112480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d918818080808080808080011a94010a480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d9188180808080808080800112480a1403d316adf68403b37ba6d766b08516b828ceedf812251624de6420337916dd0db98be8cb6cfda1dd8d7e4d2ae80e7d268b101c17afd6993e1a18d91881808080808080808001").unwrap();
+
+        let mut data = vec![];
+        let res = TmHeaderVerifier::execute(&input[..], &mut BytesRef::Flexible(&mut data));
+        assert_eq!(res, Err("No enough voting power"));
+    }
+
     #[test]
     fn test_decode_encode() {
         let input = hex::decode("4e0a1f0a141203616263220b088cca9f800610b8d48766306412070a050a0301020312290a2712251624de642001010101010101010101010101010101010101010101010101010101010101011a00").unwrap();
@@ -777,4 +862,68 @@ mod test {
         let vote: CanonicalVote = CanonicalVote::decode_length_delimited(&input1[..]).unwrap();
         println!("{:?}", vote);
     }
+
+    // One-validator adjacent-height header: trusted height 1, chain "validator-address".
+    const VALIDATOR_ADDRESS_INPUT: &str = "000000000000000000000000000000000000000000000000000000000000045d000000000000000000000000000000000000000000000000000000000000009076616c696461746f722d6164647265737300000000000000000000000000000000000000000000014141414141414141414141414141414141414141414141414141414141414141406e4bff51ac3932e117afc580452394caa456a6c412fd79728418e9e2fddeac06154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c000000000000000aab070a9e050a97030a02080a121176616c696461746f722d616464726573731802220b0880e2cfaa0610c0a9d33a3a480a2011111111111111111111111111111111111111111111111111111111111111111224080112201212121212121212121212121212121212121212121212121212121212121212422021212121212121212121212121212121212121212121212121212121212121214a2022222222222222222222222222222222222222222222222222222222222222225220406e4bff51ac3932e117afc580452394caa456a6c412fd79728418e9e2fddeac5a20406e4bff51ac3932e117afc580452394caa456a6c412fd79728418e9e2fddeac622023232323232323232323232323232323232323232323232323232323232323236a202424242424242424242424242424242424242424242424242424242424242424722025252525252525252525252525252525252525252525252525252525252525257a202626262626262626262626262626262626262626262626262626262626262626820114ef1d1070c92e611e7f74225aa95e7037ab00e27a1281020a480a20ed72e75273770da917cec0d78956c6e4ebb234f72a4cd689098c73aec9afdba2122408011220313131313131313131313131313131313131313131313131313131313131313112b4010802100222480a20ed72e75273770da917cec0d78956c6e4ebb234f72a4cd689098c73aec9afdba212240801122031313131313131313131313131313131313131313131313131313131313131312a0c0881e2cfaa06108084b8d9013214ef1d1070c92e611e7f74225aa95e7037ab00e27a42407dc4af39bb926765dc346b4c2bc35071034e37ba8b7dbe282a42d77868a09ebe1ddc40c7f5e9073c7a982f1fdfa217e7600624ce3e1ddcb5567b664dc120e4021282010a3f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a123f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a1a82010a3f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a123f0a14ef1d1070c92e611e7f74225aa95e7037ab00e27a12251624de642006154e665345a43e854628b1ac6528cc65d706bf9cc98f5b15dd02f97e8f351c180a";
+    // sha256(pub_key)[..20], i.e. the canonical address of the only validator.
+    const CANONICAL_ADDRESS: &str = "ef1d1070c92e611e7f74225aa95e7037ab00e27a";
+    // Offsets into VALIDATOR_ADDRESS_INPUT.
+    const COMMIT_SIG_ADDRESS_AT: usize = 797;
+    const COMMIT_SIG_SIGNATURE_AT: usize = 819;
+    const VALIDATOR_SET_ADDRESS_AT: usize = 890;
+
+    fn execute_hex(input: &[u8]) -> Result<String, &'static str> {
+        let mut data = vec![];
+        TmHeaderVerifier::execute(input, &mut BytesRef::Flexible(&mut data))?;
+        Ok(hex::encode(&data))
+    }
+
+    fn with_address(mut input: Vec<u8>, at: usize, byte: u8) -> Vec<u8> {
+        assert_eq!(hex::encode(&input[at..at + 20]), CANONICAL_ADDRESS);
+        input[at..at + 20].copy_from_slice(&[byte; 20]);
+        input
+    }
+
+    #[test]
+    fn test_validator_set_address_is_not_checked() {
+        use sha2::{Digest, Sha256};
+
+        let control = hex::decode(VALIDATOR_ADDRESS_INPUT).unwrap();
+        let candidate = with_address(control.clone(), VALIDATOR_SET_ADDRESS_AT, 0x43);
+        // Byte-identical to the input attached to the report.
+        assert_eq!(
+            hex::encode(Sha256::digest(&candidate)),
+            "57ec1656877a2ac78b3d0ebf986693953f84f368865c5041123911967e50c1af"
+        );
+
+        let expected = execute_hex(&control).unwrap();
+        assert_eq!(execute_hex(&candidate), Ok(expected));
+    }
+
+    #[test]
+    fn test_commit_sig_address_is_not_signed() {
+        let control = hex::decode(VALIDATOR_ADDRESS_INPUT).unwrap();
+        let expected = execute_hex(&control).unwrap();
+
+        let commit_sig_only = with_address(control.clone(), COMMIT_SIG_ADDRESS_AT, 0x44);
+        assert_eq!(execute_hex(&commit_sig_only), Ok(expected.clone()));
+
+        let both = with_address(commit_sig_only, VALIDATOR_SET_ADDRESS_AT, 0x44);
+        assert_eq!(execute_hex(&both), Ok(expected));
+    }
+
+    #[test]
+    fn test_slot_signature_is_still_verified() {
+        let mut input = hex::decode(VALIDATOR_ADDRESS_INPUT).unwrap();
+        input[COMMIT_SIG_SIGNATURE_AT] ^= 1;
+        assert_eq!(execute_hex(&input), Err("Invalid commit signature"));
+    }
 }
+
+#[cfg(test)]
+#[path = "legacy_vote_tests.rs"]
+mod legacy_vote_tests;
+
+#[cfg(test)]
+#[path = "legacy_header_tests.rs"]
+mod legacy_header_tests;

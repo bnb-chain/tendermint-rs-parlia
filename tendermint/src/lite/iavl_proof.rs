@@ -383,6 +383,39 @@ pub struct CommitmentProofOp {
     pub proof: CommitmentProof,
 }
 
+// Match encoding/binary.ReadVarint on 64-bit Go, including non-minimal
+// encodings. IAVL rejects negative values after decoding the signed varint.
+fn skip_nonnegative_go_varint(mut input: &[u8]) -> Option<&[u8]> {
+    let mut value = 0u64;
+    for index in 0..10 {
+        let (&byte, rest) = input.split_first()?;
+        input = rest;
+        if index == 9 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte < 0x80 {
+            return if value & 1 == 0 { Some(input) } else { None };
+        }
+    }
+    None
+}
+
+fn valid_iavl_leaf_prefix(prefix: &[u8]) -> bool {
+    let Some((&0, mut remaining)) = prefix.split_first() else {
+        return false;
+    };
+    // BNB's ICS23 fork requires two nonnegative signed varints after the
+    // height byte, with no leftover bytes for a leaf (ops.go: z(op, 0)).
+    for _ in 0..2 {
+        let Some(rest) = skip_nonnegative_go_varint(remaining) else {
+            return false;
+        };
+        remaining = rest;
+    }
+    remaining.is_empty()
+}
+
 impl ProofExecute for CommitmentProofOp {
     fn run(&self, value: Vec<u8>, key: Vec<u8>) -> Result<Hash, &'static str> {
         let spec = match self.field_type.as_str() {
@@ -398,6 +431,13 @@ impl ProofExecute for CommitmentProofOp {
             },
             None => return Err("invalid merkle proof"),
         };
+
+        if self.field_type == "ics23:iavl" {
+            let leaf = existence.leaf.as_ref().ok_or("missing IAVL leaf op")?;
+            if !valid_iavl_leaf_prefix(&leaf.prefix) {
+                return Err("invalid IAVL leaf prefix");
+            }
+        }
 
         let root = match calculate_existence_root(&existence) {
             Ok(r) => r,
@@ -461,12 +501,28 @@ impl KeyValueMerkleProof {
         return true;
     }
 
+    // The fixed ICS23 pipeline has two operators and a two-component metadata
+    // path (store, key). Go consumes that path from the leaf upwards; empty
+    // operator keys consume nothing and therefore cannot exhaust this path.
+    fn ics23_keys_match(&self) -> bool {
+        let [iavl_op, simple_op] = self.proof.ops.as_slice() else {
+            return false;
+        };
+        // BSC's keyVerifier forbids the ambiguous hex key-path prefix before
+        // URL escaping/decoding. All other metadata bytes round-trip unchanged.
+        !self.key.starts_with(b"x:")
+            && !self.store_name.starts_with(b"x:")
+            && !iavl_op.key.is_empty()
+            && !simple_op.key.is_empty()
+            && iavl_op.key == self.key
+            && simple_op.key == self.store_name
+    }
+
     fn validate_ics23(&self) -> bool {
         if self.value.len() == 0 {
             return false;
         }
-        // expect multi store and iavl store
-        if self.proof.ops.len() != 2 {
+        if !self.ics23_keys_match() {
             return false;
         }
 
@@ -482,7 +538,7 @@ impl KeyValueMerkleProof {
             proof: iavl_commitment,
         };
         let iavl_root_hash: Result<Hash, &'static str> =
-            iavl_commitment_proof.run(self.value.clone(), self.key.clone());
+            iavl_commitment_proof.run(self.value.clone(), iavl_op.key.clone());
         if iavl_root_hash.is_err() {
             return false;
         }
@@ -499,7 +555,7 @@ impl KeyValueMerkleProof {
             proof: simple_commitment,
         };
         let simple_root_hash: Result<Hash, &'static str> =
-            simple_commitment_proof.run(iavl_root_hash.unwrap().to_vec(), self.store_name.clone());
+            simple_commitment_proof.run(iavl_root_hash.unwrap().to_vec(), simple_op.key.clone());
         if simple_root_hash.is_err() {
             return false;
         }
@@ -663,3 +719,11 @@ mod test {
         test_serialization_roundtrip::<Proof>(payload);
     }
 }
+
+#[cfg(test)]
+#[path = "iavl_key_tests.rs"]
+mod iavl_key_tests;
+
+#[cfg(test)]
+#[path = "iavl_leaf_tests.rs"]
+mod iavl_leaf_tests;
